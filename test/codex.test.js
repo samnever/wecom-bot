@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CodexResponder } from "../src/codex.js";
+import { buildCodexOptions, CodexResponder } from "../src/codex.js";
 
 function createFakeCodex(chunks = ["测试", "测试回答"], finalResponse = "测试回答") {
   const started = [];
@@ -50,12 +50,35 @@ function createFakeCodex(chunks = ["测试", "测试回答"], finalResponse = "�
 }
 
 const config = {
-  model: "gpt-6-luna",
+  model: "gpt-5.6-luna",
   reasoningEffort: "low",
+  httpsOnly: true,
+  fastMode: false,
+  maxRetries: 1,
+  retryDelayMs: 0,
   workingDirectory: "C:\\isolated-runtime",
   maxConversations: 10,
   instructions: "只回答问题",
 };
+
+test("buildCodexOptions configures ChatGPT HTTPS-only transport", () => {
+  assert.deepEqual(buildCodexOptions({ httpsOnly: true, fastMode: true }), {
+    config: {
+      service_tier: "fast",
+      features: { fast_mode: true },
+      model_provider: "chatgpt_http",
+      model_providers: {
+        chatgpt_http: {
+          name: "ChatGPT HTTP",
+          base_url: "https://chatgpt.com/backend-api/codex",
+          wire_api: "responses",
+          requires_openai_auth: true,
+          supports_websockets: false,
+        },
+      },
+    },
+  });
+});
 
 test("CodexResponder starts a Luna low thread and streams the final response", async () => {
   const fake = createFakeCodex();
@@ -69,7 +92,7 @@ test("CodexResponder starts a Luna low thread and streams the final response", a
   assert.equal(answer, "测试回答");
   assert.deepEqual(updates, ["测试", "测试回答"]);
   assert.deepEqual(fake.started[0].options, {
-    model: "gpt-6-luna",
+    model: "gpt-5.6-luna",
     modelReasoningEffort: "low",
     sandboxMode: "read-only",
     workingDirectory: "C:\\isolated-runtime",
@@ -162,4 +185,87 @@ test("CodexResponder surfaces a streamed turn failure", async () => {
     responder.generateAnswer("single:user", "hello"),
     /模型失败/,
   );
+});
+
+test("CodexResponder retries a timed out request with a fresh thread", async () => {
+  let attempts = 0;
+  const fake = {
+    startThread() {
+      attempts += 1;
+      const currentAttempt = attempts;
+      return {
+        async runStreamed() {
+          return {
+            events: (async function* () {
+              if (currentAttempt === 1) {
+                yield {
+                  type: "turn.failed",
+                  error: { message: "request timed out" },
+                };
+                return;
+              }
+              yield {
+                type: "item.completed",
+                item: { id: "answer", type: "agent_message", text: "重试成功" },
+              };
+            })(),
+          };
+        },
+      };
+    },
+  };
+  const updates = [];
+  const responder = new CodexResponder(config, fake);
+
+  assert.equal(
+    await responder.generateAnswer("single:user", "hello", (text) => {
+      updates.push(text);
+    }),
+    "重试成功",
+  );
+  assert.equal(attempts, 2);
+  assert.deepEqual(updates, ["连接超时，正在重试（1/1）…"]);
+});
+
+test("CodexResponder keeps waiting through Codex reconnect notices", async () => {
+  let threads = 0;
+  const fake = {
+    startThread() {
+      threads += 1;
+      return {
+        async runStreamed() {
+          return {
+            events: (async function* () {
+              yield {
+                type: "error",
+                message: "Reconnecting... 2/5 (request timed out)",
+              };
+              yield {
+                type: "error",
+                message: "Reconnecting... 5/5 (request timed out)",
+              };
+              yield {
+                type: "item.completed",
+                item: { id: "answer", type: "agent_message", text: "最终成功" },
+              };
+            })(),
+          };
+        },
+      };
+    },
+  };
+  const updates = [];
+  const responder = new CodexResponder(config, fake);
+
+  assert.equal(
+    await responder.generateAnswer("single:user", "hello", (text) => {
+      updates.push(text);
+    }),
+    "最终成功",
+  );
+  assert.equal(threads, 1);
+  assert.deepEqual(updates, [
+    "模型连接超时，正在重连（2/5）…",
+    "模型连接超时，正在重连（5/5）…",
+  ]);
 });
