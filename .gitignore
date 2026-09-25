@@ -1,0 +1,7 @@
+node_modules/
+.env
+.npm-cache/
+.codex-bot-runtime/
+npm-debug.log*
+*.log
+
